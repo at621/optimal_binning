@@ -1,0 +1,26 @@
+# Exclude Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Exclude Python cache files
+__pycache__/
+*.py[cod]
+
+# Exclude specific files
+# Add filenames you want to ignore here
+main-*.ipynb
+
+# Exclude system files
+.DS_Store
+Thumbs.db
+
+# Exclude virtual environment folders
+venv/
+.env/
+
+# Exclude compiled files
+*.so
+*.o
+*.a
+
+# Logs
+*.log
