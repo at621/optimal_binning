@@ -122,7 +122,7 @@ class BinningOptimizer:
 
         return result_stats
 
-    # def create_pools(self, events, non_events, lra_drs, min_bins, max_bins):
+    @memory_time_decorator
     def create_pools(self, min_bins=5, max_bins=20, monotonical=True):
         """Finds optimal binning given potential cutoffs"""
 
