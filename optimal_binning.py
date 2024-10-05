@@ -37,7 +37,10 @@ def memory_time_decorator(func):
 
 class BinningOptimizer:
     def __init__(self):
-        pass
+        self.input_df = None
+
+    def get_dataframe(self):
+        return self.input_df
 
     def calculate_iv(self, events, non_events, total_events, total_non_events):
         # Calculate the percentage of events and non-events
@@ -119,10 +122,11 @@ class BinningOptimizer:
 
         return result_stats
 
-    def create_pools(self, events, non_events, lra_drs, min_bins, max_bins):
+    # def create_pools(self, events, non_events, lra_drs, min_bins, max_bins):
+    def create_pools(self, min_bins=5, max_bins=20, monotonical=True):
         """Finds optimal binning given potential cutoffs"""
 
-        n = len(events)
+        n = len(self.events)
 
         # Create the model.
         model = cp_model.CpModel()
@@ -137,7 +141,7 @@ class BinningOptimizer:
                 x[i, j] = model.NewBoolVar(f"x[{i},{j}]")
 
         # Create supporting data
-        bin_data = self.individual_bin_stats(events, non_events)
+        bin_data = self.individual_bin_stats(self.events, self.non_events)
         iv = {key: val[0] for key, val in bin_data.items()}
 
         # Create bin options that should be excluded from consideration
@@ -157,10 +161,11 @@ class BinningOptimizer:
                 model.Add(x[i1, j1] + x[i2, j2] <= 1)
 
         # Reject bins if the default rates are not monotonically increasing
-        for key, value in excluded_bin_combos.items():
-            if value[1] == 1:
-                ((i1, j1), (i2, j2)) = key
-                model.Add(x[i1, j1] + x[i2, j2] <= 1)
+        if monotonical:
+            for key, value in excluded_bin_combos.items():
+                if value[1] == 1:
+                    ((i1, j1), (i2, j2)) = key
+                    model.Add(x[i1, j1] + x[i2, j2] <= 1)
 
         # Maximum number of bins (max_bins)
         model.Add(
@@ -189,11 +194,24 @@ class BinningOptimizer:
                     if solver.Value(x[i, j]) == 1:
                         bins.append([i - 1, j - 1])
 
+        # Creating a dictionary where the key is the element number
+        bin_dict = {index: pair for index, pair in enumerate(bins)}
+        self.add_mapped_column("bins", bin_dict)
+
         return bins, status, solver, iv, bin_data, excluded_bin_combos
 
-    # Note: VarArraySolutionPrinter is assumed to be defined elsewhere as per the original code context.
+    def add_mapped_column(self, bin_col, mapping_dict):
+        # Define a function to map the old bin number using the dictionary
+        def map_bin_number(bin_number):
+            for key, value in mapping_dict.items():
+                if value[0] <= bin_number <= value[1]:
+                    return key
+            return None  # If no match is found, return None
 
-    def create_bins_with_decision_tree(self, df, n_bins=40, min_samples_leaf=1000):
+        # Apply the mapping function to the specified column to create the new column
+        self.input_df["new_bin"] = self.input_df[bin_col].apply(map_bin_number)
+
+    def create_bins(self, df, n_bins=40, min_samples_leaf=1000):
         """
         Create bins using a decision tree regressor.
 
@@ -246,6 +264,114 @@ class BinningOptimizer:
         self.longrun_average_dr = stats_combined["lra_dr"]
 
         return stats_combined, df
+
+    def create_raw_bins(self, df, method="tree", n_bins=40, min_samples_leaf=1000):
+        """
+        Create bins using the specified method ('tree', 'qcut', 'cut').
+
+        Args:
+            df (pd.DataFrame): DataFrame containing the score and target variables.
+            method (str, optional): Method to create bins. Options are 'tree', 'qcut', 'cut'. Default is 'tree'.
+            n_bins (int, optional): Number of bins to create. Default is 40.
+            min_samples_leaf (int, optional): Minimum number of samples per leaf (used for 'tree' method only). Default is 1000.
+
+        Returns:
+            pd.DataFrame: DataFrame with an additional 'bins' column.
+        """
+        self.input_df = df
+
+        if method == "tree":
+            df = self.create_bins_with_decision_tree(
+                df, n_bins=n_bins, min_samples_leaf=min_samples_leaf
+            )
+        elif method == "qcut":
+            df = self.create_bins_with_qcut(df, n_bins=n_bins)
+        elif method == "cut":
+            df = self.create_bins_with_cut(df, n_bins=n_bins)
+        else:
+            raise ValueError("Invalid method. Choose from 'tree', 'qcut', 'cut'.")
+
+        # Get input data per bin
+        stats_combined = df.groupby("bins").agg({"target": ["sum", "count"]})
+        stats_combined = stats_combined.reset_index()
+        stats_combined.columns = ["bins", "events", "count"]
+        stats_combined["non_events"] = (
+            stats_combined["count"] - stats_combined["events"]
+        )
+        stats_combined["default_rate"] = (
+            stats_combined["events"] / stats_combined["count"]
+        )
+
+        # Add long-run averages
+        annual_averages = df.groupby(["bins", "year"])["score"].mean()
+        average_scores_per_bin = annual_averages.groupby("bins").mean().reset_index()
+        average_scores_per_bin.columns = ["bins", "lra_dr"]
+
+        stats_combined = pd.merge(
+            stats_combined, average_scores_per_bin, on="bins", how="left"
+        )
+
+        # Test solution
+        self.events = stats_combined["events"]
+        self.non_events = stats_combined["non_events"]
+        self.longrun_average_dr = stats_combined["lra_dr"]
+
+        return stats_combined, df
+
+    def create_bins_with_decision_tree(self, df, n_bins=40, min_samples_leaf=1000):
+        """
+        Create bins using a decision tree regressor.
+
+        Args:
+            df (pd.DataFrame): DataFrame containing the score and target variables.
+            n_bins (int, optional): Number of bins to create. Default is 40.
+            min_samples_leaf (int, optional): Minimum number of samples per leaf. Default is 1000.
+
+        Returns:
+            pd.DataFrame: DataFrame with an additional 'bins' column.
+        """
+        clf = DecisionTreeRegressor(
+            max_depth=n_bins, min_samples_leaf=min_samples_leaf, max_leaf_nodes=n_bins
+        )
+        clf.fit(df[["score"]], df["target"])
+        thresholds = clf.tree_.threshold[clf.tree_.threshold > _tree.TREE_UNDEFINED]
+
+        # Add minimum and maximum edges
+        bins = sorted([-np.inf] + list(thresholds) + [np.inf])
+        df["bins"] = pd.cut(df["score"], bins, labels=False)
+        return df
+
+    def create_bins_with_qcut(self, df, n_bins=40):
+        """
+        Create bins using quantile-based binning (qcut).
+
+        Args:
+            df (pd.DataFrame): DataFrame containing the score variable.
+            n_bins (int, optional): Number of bins to create. Default is 40.
+
+        Returns:
+            pd.DataFrame: DataFrame with an additional 'bins' column.
+        """
+        quantiles = np.linspace(0, 1, n_bins + 1)
+        bins = np.quantile(df["score"], quantiles)
+        df["bins"] = np.digitize(df["score"], bins, right=False) - 1
+        return df
+
+    def create_bins_with_cut(self, df, n_bins=40):
+        """
+        Create bins using uniform-width binning (cut).
+
+        Args:
+            df (pd.DataFrame): DataFrame containing the score variable.
+            n_bins (int, optional): Number of bins to create. Default is 40.
+
+        Returns:
+            pd.DataFrame: DataFrame with an additional 'bins' column.
+        """
+        min_score, max_score = df["score"].min(), df["score"].max()
+        bins = np.linspace(min_score, max_score, n_bins + 1)
+        df["bins"] = np.digitize(df["score"], bins, right=False) - 1
+        return df
 
 
 class VarArraySolutionPrinter(cp_model.CpSolverSolutionCallback):
